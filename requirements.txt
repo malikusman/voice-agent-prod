@@ -1,0 +1,8 @@
+flask==2.3.3
+flask-sqlalchemy==3.0.5
+psycopg2-binary==2.9.7
+sqlalchemy==2.0.23
+python-decouple==3.8
+waitress==2.1.2
+python-dotenv==1.0.0
+gunicorn==21.2.0
