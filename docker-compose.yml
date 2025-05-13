@@ -17,5 +17,30 @@ services:
       timeout: 5s
       retries: 5
 
-volumes:
-  postgres_data:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "5000:5000"
+    environment:
+      - FLASK_ENV=development
+      - DATABASE_URL=postgresql://voice_agent_user:VoIc3Ag3NT2025@postgres:5432/voice_agent
+      - LANGSMITH_API_KEY=${LANGSMITH_API_KEY}
+      - LANGCHAIN_TRACING_V2=true
+      - LANGCHAIN_ENDPOINT=https://api.smith.langchain.com
+      - LANGCHAIN_PROJECT=voice-agent-prod
+      - TWILIO_ACCOUNT_SID=${TWILIO_ACCOUNT_SID}
+      - TWILIO_AUTH_TOKEN=${TWILIO_AUTH_TOKEN}
+      - TWILIO_PHONE_NUMBER=${TWILIO_PHONE_NUMBER}
+      - GOOGLE_CREDENTIALS_FILE=/app/voice-agent-tts-f35a11057093.json
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - BASE_URL=${BASE_URL}
+    volumes:
+      - .:/app
+      - ./voice-agent-tts-f35a11057093.json:/app/voice-agent-tts-f35a11057093.json
+      - ./migrations:/app/migrations
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: gunicorn --bind 0.0.0.0:5000 src.api.routes:app
