@@ -1,5 +1,6 @@
-from pathlib import Path
+import os
 import uuid
+from pathlib import Path
 import logging
 from decouple import config
 from google.cloud import texttospeech
@@ -10,8 +11,9 @@ logger = logging.getLogger(__name__)
 AUDIO_FILES_DIR = Path("static/audio_files")
 AUDIO_FILES_DIR.mkdir(exist_ok=True)
 
-# Set up Google TTS
-credentials = service_account.Credentials.from_service_account_file(config('GOOGLE_CREDENTIALS_FILE'))
+credentials = service_account.Credentials.from_service_account_file(
+    config('GOOGLE_CREDENTIALS_FILE')
+)
 tts_client = texttospeech.TextToSpeechClient(credentials=credentials)
 
 voice = texttospeech.VoiceSelectionParams(

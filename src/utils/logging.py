@@ -1,12 +1,16 @@
 import logging
-import sys
+import os
+from pathlib import Path
 
 def setup_logging():
-    """Configure logging for the application"""
+    log_dir = Path("log")
+    log_dir.mkdir(exist_ok=True)
+
     logging.basicConfig(
         level=logging.INFO,
-        format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.StreamHandler(sys.stdout)
+            logging.FileHandler(log_dir / "app.log"),
+            logging.StreamHandler()
         ]
     )

@@ -9,12 +9,14 @@ from typing import TypedDict, Optional
 from langgraph.graph import StateGraph, END
 from decouple import config
 from src.models.booking import Booking
-from src.api.routes import db
+from src.db import db
 
 logger = logging.getLogger(__name__)
 
+# Initialize OpenAI client
 client = OpenAI(api_key=config("OPENAI_API_KEY"))
 
+# Sample restaurant info
 restaurant_info = [
     "The restaurant is open from 10 AM to 10 PM every day.",
     "We offer a variety of dishes including pasta, pizza, salads, and desserts.",
@@ -23,11 +25,32 @@ restaurant_info = [
     "Reservations can be made online or by calling us."
 ]
 
-embeddings = [client.embeddings.create(model="text-embedding-3-small", input=chunk).data[0].embedding for chunk in restaurant_info]
-embeddings = np.array(embeddings).astype('float32')
-dimension = embeddings.shape[1]
-index = faiss.IndexFlatL2(dimension)
-index.add(embeddings)
+class EmbeddingManager:
+    def __init__(self):
+        self.embeddings = None
+        self.index = None
+        self.dimension = None
+
+    def initialize_embeddings(self):
+        """Initialize embeddings and FAISS index for restaurant info."""
+        try:
+            self.embeddings = [
+                client.embeddings.create(model="text-embedding-3-small", input=chunk).data[0].embedding
+                for chunk in restaurant_info
+            ]
+            self.embeddings = np.array(self.embeddings).astype('float32')
+            self.dimension = self.embeddings.shape[1]
+            self.index = faiss.IndexFlatL2(self.dimension)
+            self.index.add(self.embeddings)
+            logger.info("Embeddings and FAISS index initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize embeddings: {e}")
+            self.embeddings = []
+            self.index = None
+            self.dimension = None
+
+# Global embedding manager
+embedding_manager = EmbeddingManager()
 
 class State(TypedDict):
     text: Optional[str]
@@ -72,13 +95,18 @@ def classify_intent_node(state: State) -> dict:
     
     Respond with only the intent label.
     """
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "system", "content": "You are an intent classifier."}, {"role": "user", "content": prompt}]
-    )
-    intent = response.choices[0].message.content.strip()
-    logger.info(f"Classified intent: {intent} for text: '{text}'")
-    
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "system", "content": "You are an intent classifier."}, {"role": "user", "content": prompt}]
+        )
+        intent = response.choices[0].message.content.strip()
+        logger.info(f"Classified intent: {intent} for text: '{text}'")
+    except Exception as e:
+        logger.error(f"Error classifying intent: {e}")
+        intent = "general_info"
+        logger.info(f"Defaulting to intent: {intent}")
+
     reset_confirmation = intent == "create_booking" and not current_state["awaiting_confirmation"]
     
     return {
@@ -121,20 +149,25 @@ def create_booking_node(state: State) -> dict:
         confirmation_phrases = ["yes", "correct", "right", "sounds good", "confirm", "okay"]
         rejection_phrases = ["no", "wrong", "not right", "change it"]
         
+        confirmation = None
         if any(phrase in text_lower for phrase in confirmation_phrases):
             confirmation = "yes"
         elif any(phrase in text_lower for phrase in rejection_phrases):
             confirmation = "no"
         else:
-            prompt = f"""
-            Does the user confirm the booking in this message: '{text}'? Respond with 'yes' or 'no'.
-            """
-            response = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[{"role": "system", "content": "You are a confirmation detector."}, {"role": "user", "content": prompt}]
-            )
-            confirmation = response.choices[0].message.content.strip().lower()
-        
+            try:
+                prompt = f"""
+                Does the user confirm the booking in this message: '{text}'? Respond with 'yes' or 'no'.
+                """
+                response = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[{"role": "system", "content": "You are a confirmation detector."}, {"role": "user", "content": prompt}]
+                )
+                confirmation = response.choices[0].message.content.strip().lower()
+            except Exception as e:
+                logger.error(f"Error detecting confirmation: {e}")
+                confirmation = "no"
+
         if confirmation == "yes":
             booking_id = db.session.query(db.func.max(Booking.booking_id)).scalar() or 0
             booking_id += 1
@@ -143,19 +176,30 @@ def create_booking_node(state: State) -> dict:
                 phone_number=current_phone,
                 time=current_time
             )
-            db.session.add(booking)
-            db.session.commit()
-            logger.info(f"Booking saved: ID {booking_id}, Phone {current_phone}, Time {current_time}")
-            response_text = f"Great, your booking is confirmed with ID {booking_id} for {current_time}. We'll call {current_phone} to confirm. Is there anything else I can help you with?"
-            return {
-                "response": response_text,
-                "booking_time": None,
-                "booking_phone": None,
-                "booking_id": None,
-                "awaiting_confirmation": False,
-                "in_booking_flow": False,
-                "awaiting_further_assistance": True
-            }
+            try:
+                db.session.add(booking)
+                db.session.commit()
+                logger.info(f"Booking saved: ID {booking_id}, Phone {current_phone}, Time {current_time}")
+                response_text = f"Great, your booking is confirmed with ID {booking_id} for {current_time}. We'll call {current_phone} to confirm. Is there anything else I can help you with?"
+                return {
+                    "response": response_text,
+                    "booking_time": None,
+                    "booking_phone": None,
+                    "booking_id": None,
+                    "awaiting_confirmation": False,
+                    "in_booking_flow": False,
+                    "awaiting_further_assistance": True
+                }
+            except Exception as e:
+                logger.error(f"Error saving booking: {e}")
+                response_text = "Sorry, there was an issue saving your booking. Please try again."
+                return {
+                    "response": response_text,
+                    "booking_time": None,
+                    "booking_phone": None,
+                    "awaiting_confirmation": False,
+                    "in_booking_flow": True
+                }
         else:
             response_text = "Okay, let's try again. What time would you like to book for?"
             return {
@@ -173,11 +217,15 @@ def create_booking_node(state: State) -> dict:
     For 'time', format as 'H AM/PM' or 'H:MM AM/PM'.
     For 'phone_number', expect formats like '123-456-7890'.
     """
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "system", "content": "You are a booking details extractor."}, {"role": "user", "content": prompt}]
-    )
-    booking_details = json.loads(response.choices[0].message.content.strip())
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "system", "content": "You are a booking details extractor."}, {"role": "user", "content": prompt}]
+        )
+        booking_details = json.loads(response.choices[0].message.content.strip())
+    except Exception as e:
+        logger.error(f"Error extracting booking details: {e}")
+        booking_details = {"phone_number": None, "time": None}
 
     phone_number = booking_details["phone_number"] or current_phone
     raw_time = booking_details["time"] or current_time
@@ -254,11 +302,15 @@ def retrieve_booking_node(state: State) -> dict:
     For 'phone_number', expect formats like '123-456-7890'.
     For 'booking_id', return a numeric string or null.
     """
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "system", "content": "You are a booking details extractor."}, {"role": "user", "content": prompt}]
-    )
-    data = json.loads(response.choices[0].message.content.strip())
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "system", "content": "You are a booking details extractor."}, {"role": "user", "content": prompt}]
+        )
+        data = json.loads(response.choices[0].message.content.strip())
+    except Exception as e:
+        logger.error(f"Error extracting booking details: {e}")
+        data = {"phone_number": None, "booking_id": None}
 
     phone_number = data.get("phone_number") or current_phone
     booking_id = data.get("booking_id") or current_booking_id
@@ -273,10 +325,13 @@ def retrieve_booking_node(state: State) -> dict:
         }
 
     booking = None
-    if booking_id:
-        booking = db.session.query(Booking).filter_by(booking_id=int(booking_id)).first()
-    elif phone_number:
-        booking = db.session.query(Booking).filter_by(phone_number=phone_number).first()
+    try:
+        if booking_id:
+            booking = db.session.query(Booking).filter_by(booking_id=int(booking_id)).first()
+        elif phone_number:
+            booking = db.session.query(Booking).filter_by(phone_number=phone_number).first()
+    except Exception as e:
+        logger.error(f"Error querying booking: {e}")
 
     if booking:
         response_text = f"Your booking ID is {booking.booking_id} for {booking.time}, registered under {booking.phone_number}. Would you like to update this booking?"
@@ -307,20 +362,32 @@ def update_booking_node(state: State) -> dict:
     if awaiting_confirmation:
         text_lower = text.lower()
         if any(phrase in text_lower for phrase in ["yes", "correct", "right", "sounds good"]):
-            booking = db.session.query(Booking).filter_by(booking_id=int(current_booking_id)).first()
-            if booking:
-                booking.phone_number = current_phone
-                booking.time = current_time
-                db.session.commit()
-                response_text = f"Booking updated to {current_time} for {current_phone}. Anything else?"
+            try:
+                booking = db.session.query(Booking).filter_by(booking_id=int(current_booking_id)).first()
+                if booking:
+                    booking.phone_number = current_phone
+                    booking.time = current_time
+                    db.session.commit()
+                    response_text = f"Booking updated to {current_time} for {current_phone}. Anything else?"
+                    return {
+                        "response": response_text,
+                        "booking_time": None,
+                        "booking_phone": None,
+                        "booking_id": None,
+                        "awaiting_confirmation": False,
+                        "in_update_flow": False,
+                        "awaiting_further_assistance": True
+                    }
+            except Exception as e:
+                logger.error(f"Error updating booking: {e}")
+                response_text = "Sorry, there was an issue updating your booking. Please try again."
                 return {
                     "response": response_text,
                     "booking_time": None,
                     "booking_phone": None,
-                    "booking_id": None,
+                    "booking_id": current_booking_id,
                     "awaiting_confirmation": False,
-                    "in_update_flow": False,
-                    "awaiting_further_assistance": True
+                    "in_update_flow": True
                 }
         response_text = "Okay, what time or phone number would you like to update to?"
         return {
@@ -337,11 +404,15 @@ def update_booking_node(state: State) -> dict:
     Return a JSON object with keys: 'phone_number', 'time', 'booking_id'.
     If a value is not found, use null.
     """
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "system", "content": "You are a booking details extractor."}, {"role": "user", "content": prompt}]
-    )
-    data = json.loads(response.choices[0].message.content.strip())
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "system", "content": "You are a booking details extractor."}, {"role": "user", "content": prompt}]
+        )
+        data = json.loads(response.choices[0].message.content.strip())
+    except Exception as e:
+        logger.error(f"Error extracting update details: {e}")
+        data = {"phone_number": None, "time": None, "booking_id": None}
 
     phone_number = data.get("phone_number") or current_phone
     raw_time = data.get("time") or current_time
@@ -359,10 +430,13 @@ def update_booking_node(state: State) -> dict:
         }
 
     booking = None
-    if booking_id:
-        booking = db.session.query(Booking).filter_by(booking_id=int(booking_id)).first()
-    elif phone_number:
-        booking = db.session.query(Booking).filter_by(phone_number=phone_number).first()
+    try:
+        if booking_id:
+            booking = db.session.query(Booking).filter_by(booking_id=int(booking_id)).first()
+        elif phone_number:
+            booking = db.session.query(Booking).filter_by(phone_number=phone_number).first()
+    except Exception as e:
+        logger.error(f"Error querying booking for update: {e}")
 
     if not booking:
         response_text = "No booking found. Would you like to create a new booking?"
@@ -390,16 +464,29 @@ def general_info_node(state: State) -> dict:
         response_text = "Thank you for calling! Goodbye."
         return {"response": response_text, "in_booking_flow": False}
 
-    response = client.embeddings.create(model="text-embedding-3-small", input=text)
-    query_embedding = np.array([response.data[0].embedding]).astype('float32')
-    distances, indices = index.search(query_embedding, 1)
-    relevant_chunks = [restaurant_info[i] for i in indices[0]]
-    prompt = f"User query: '{text}'\nRelevant information: {' '.join(relevant_chunks)}\nGenerate a concise response."
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": prompt}]
-    )
-    response_text = response.choices[0].message.content.strip()
+    # Initialize embeddings if not already done
+    if not embedding_manager.index:
+        embedding_manager.initialize_embeddings()
+
+    if not embedding_manager.index:
+        response_text = "Sorry, I'm having trouble accessing restaurant information. Please try again later."
+        return {"response": response_text, "in_booking_flow": False}
+
+    try:
+        response = client.embeddings.create(model="text-embedding-3-small", input=text)
+        query_embedding = np.array([response.data[0].embedding]).astype('float32')
+        distances, indices = embedding_manager.index.search(query_embedding, 1)
+        relevant_chunks = [restaurant_info[i] for i in indices[0]]
+        prompt = f"User query: '{text}'\nRelevant information: {' '.join(relevant_chunks)}\nGenerate a concise response."
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "system", "content": "You are a helpful assistant."}, {"role": "user", "content": prompt}]
+        )
+        response_text = response.choices[0].message.content.strip()
+    except Exception as e:
+        logger.error(f"Error processing general info: {e}")
+        response_text = "Sorry, I couldn't process your request. Could you repeat that?"
+
     return {"response": response_text, "in_booking_flow": False}
 
 def confirm_assistance_node(state: State) -> dict:
@@ -408,12 +495,16 @@ def confirm_assistance_node(state: State) -> dict:
     Does the user need further assistance based on: '{text}'?
     Return a JSON object with key 'needs_assistance' and value 'yes', 'no', or 'unsure'.
     """
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "system", "content": "You are an assistance detector."}, {"role": "user", "content": prompt}]
-    )
-    data = json.loads(response.choices[0].message.content.strip())
-    needs_assistance = data.get("needs_assistance", "unsure")
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "system", "content": "You are an assistance detector."}, {"role": "user", "content": prompt}]
+        )
+        data = json.loads(response.choices[0].message.content.strip())
+        needs_assistance = data.get("needs_assistance", "unsure")
+    except Exception as e:
+        logger.error(f"Error detecting assistance needs: {e}")
+        needs_assistance = "unsure"
 
     if needs_assistance == "no":
         response_text = "Thank you for calling! Goodbye."
@@ -456,6 +547,10 @@ def process_text(text: str, state: dict = None) -> tuple[str, dict]:
         state = {"text": text, "in_booking_flow": False}
     else:
         state["text"] = text
-    result = app.invoke(state)
-    logger.info(f"Process_text result: {result}")
-    return result["response"], result
+    try:
+        result = app.invoke(state)
+        logger.info(f"Process_text result: {result}")
+        return result["response"], result
+    except Exception as e:
+        logger.error(f"Error in process_text: {e}")
+        return "Sorry, something went wrong. Please try again.", state

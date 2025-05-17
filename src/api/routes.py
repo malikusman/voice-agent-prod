@@ -1,6 +1,4 @@
-from flask import Flask, Response, request, url_for
-from flask_sqlalchemy import SQLAlchemy
-from decouple import config
+from flask import Flask, Response, request
 from twilio.twiml.voice_response import VoiceResponse, Gather
 from twilio.rest import Client
 import logging
@@ -8,27 +6,51 @@ import os
 import time
 import threading
 from datetime import datetime
+from pathlib import Path
 from src.utils.logging import setup_logging
 from src.utils.audio_buffer import CallSession
 from src.services.twilio_service import text_to_speech
 from src.services.workflow_service import process_text
 from src.models.call import Call
+from src.models.base import Base
+from src.db import db
+from decouple import config
+from sqlalchemy.sql import text
 
 setup_logging()
 logger = logging.getLogger(__name__)
+logger.info(f"Loaded OPENAI_API_KEY: {os.getenv('OPENAI_API_KEY')}")
 
 app = Flask(__name__)
-
 app.config['SQLALCHEMY_DATABASE_URI'] = config('DATABASE_URL')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-db = SQLAlchemy(app)
+# Initialize db with the Flask app
+db.init_app(app)
+
+# Import models
+from src.models.call import Call
+from src.models.booking import Booking
+from src.models.transcript import Transcript
+from src.models.langgraph_state import LangGraphState
 
 twilio_client = Client(config('TWILIO_ACCOUNT_SID'), config('TWILIO_AUTH_TOKEN'))
+
+# Create tables and log database connection
+with app.app_context():
+    logger.info(f"Connected to database: {db.engine.url.database}")
+    logger.info("Attempting to create database tables")
+    try:
+        db.create_all()
+        logger.info("Tables created successfully")
+        logger.info(f"Created tables: {Base.metadata.tables.keys()}")
+    except Exception as e:
+        logger.error(f"Failed to create tables: {str(e)}")
 
 active_calls = {}
 
 AUDIO_FILES_DIR = Path("static/audio_files")
+AUDIO_FILES_DIR.mkdir(exist_ok=True)
 
 def cleanup_old_audio_files():
     """Remove old audio files"""
@@ -49,15 +71,14 @@ def run_cleanup():
 cleanup_thread = threading.Thread(target=run_cleanup, daemon=True)
 cleanup_thread.start()
 
-@app.route('/health', methods=['GET'])
-def health_check():
+@app.route('/health')
+def health():
     try:
-        db.session.execute('SELECT 1')
-        logger.info("Health check: OK")
-        return 'OK', 200
+        db.session.execute(text('SELECT 1'))
+        return 'OK'
     except Exception as e:
-        logger.error(f"Health check failed: {e}")
-        return 'Database connection failed', 500
+        app.logger.error(f'Health check failed: {str(e)}')
+        return 'Database connection failed'
 
 @app.route('/answer', methods=['POST'])
 def answer_call():
@@ -96,8 +117,7 @@ def answer_call():
 
 @app.route('/audio/<path:filename>', methods=['GET'])
 def static_audio(filename):
-    from pathlib import Path
-    audio_path = Path('static/audio_files') / filename
+    audio_path = AUDIO_FILES_DIR / filename
     return Response(open(audio_path, 'rb').read(), mimetype='audio/mpeg')
 
 @app.route('/handle-user-input', methods=['POST'])

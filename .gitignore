@@ -1,0 +1,17 @@
+# Ignore env files
+.env
+.env.*
+
+# Ignore credential files
+*.json
+
+# Specifically ignore service account keys
+voice-agent-tts-*.json
+
+# Ignore log files
+*.log
+log/
+
+# Python virtual environment
+.venv/
+venv/
