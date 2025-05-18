@@ -71,6 +71,44 @@ def run_cleanup():
 cleanup_thread = threading.Thread(target=run_cleanup, daemon=True)
 cleanup_thread.start()
 
+# NEW: Outbound Call Function
+def make_outbound_call():
+    """Make an outbound call to a number from numbers.txt after 1 minute."""
+    logger.info("Starting outbound call process...")
+    time.sleep(10)  # Wait 1 minute
+
+    numbers_file = Path("numbers.txt")
+    if not numbers_file.exists():
+        logger.error("numbers.txt not found!")
+        return
+
+    with open(numbers_file, "r") as f:
+        phone_number = f.readline().strip()  # Read the first line
+        if not phone_number:
+            logger.error("No phone number found in numbers.txt!")
+            return
+
+    logger.info(f"Making outbound call to {phone_number}...")
+
+    # Create TwiML for the call
+    response = VoiceResponse()
+    response.say("You have a reservation today at 7 PM.", voice="Polly.Joanna")
+
+    # Make the outbound call
+    try:
+        call = twilio_client.calls.create(
+            to=phone_number,
+            from_=config('TWILIO_PHONE_NUMBER'),
+            twiml=str(response)
+        )
+        logger.info(f"Call initiated: {call.sid}")
+    except Exception as e:
+        logger.error(f"Error making outbound call: {e}")
+
+# NEW: Trigger outbound call in a separate thread
+outbound_thread = threading.Thread(target=make_outbound_call, daemon=True)
+outbound_thread.start()
+
 @app.route('/health')
 def health():
     try:
