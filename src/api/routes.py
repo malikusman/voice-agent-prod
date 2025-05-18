@@ -5,6 +5,8 @@ import logging
 import os
 import time
 import threading
+import json
+import base64
 from datetime import datetime
 from pathlib import Path
 from src.utils.logging import setup_logging
@@ -16,6 +18,9 @@ from src.models.base import Base
 from src.db import db
 from decouple import config
 from sqlalchemy.sql import text
+# NEW: Imports for Flask-SocketIO and Deepgram
+from flask_socketio import SocketIO, emit
+from deepgram import DeepgramClient, PrerecordedOptions
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -24,6 +29,9 @@ logger.info(f"Loaded OPENAI_API_KEY: {os.getenv('OPENAI_API_KEY')}")
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = config('DATABASE_URL')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+
+# NEW: Initialize Flask-SocketIO
+socketio = SocketIO(app, cors_allowed_origins="*")
 
 # Initialize db with the Flask app
 db.init_app(app)
@@ -35,6 +43,9 @@ from src.models.transcript import Transcript
 from src.models.langgraph_state import LangGraphState
 
 twilio_client = Client(config('TWILIO_ACCOUNT_SID'), config('TWILIO_AUTH_TOKEN'))
+
+# NEW: Initialize Deepgram
+deepgram = DeepgramClient(config('DEEPGRAM_API_KEY'))
 
 # Create tables and log database connection
 with app.app_context():
@@ -109,6 +120,100 @@ def make_outbound_call():
 outbound_thread = threading.Thread(target=make_outbound_call, daemon=True)
 outbound_thread.start()
 
+# NEW: WebSocket Handling for Twilio Streams
+call_sid_map = {}  # Map streamSid to callSid
+
+@socketio.on('connect')
+def handle_connect():
+    logger.info("WebSocket client connected")
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    logger.info("WebSocket client disconnected")
+
+@socketio.on('message')
+def handle_message(data):
+    try:
+        data = json.loads(data)
+        event = data.get('event')
+
+        if event == 'start':
+            stream_sid = data.get('streamSid')
+            call_sid = call_sid_map.get('pending')
+            if call_sid:
+                call_sid_map[stream_sid] = call_sid
+                logger.info(f"Mapped CallSid {call_sid} to streamSid: {stream_sid}")
+            else:
+                logger.warning("No pending CallSid found during stream start")
+
+        elif event == 'media':
+            stream_sid = data.get('streamSid')
+            call_sid = call_sid_map.get(stream_sid, "unknown")
+            payload = data['media']['payload']
+            ulaw_audio = base64.b64decode(payload)
+
+            # Send audio to Deepgram for transcription
+            options = PrerecordedOptions(
+                model="nova-2",
+                smart_format=True,
+                language="en-US",
+                punctuate=True,
+                filler_words=True
+            )
+            response = deepgram.listen.prerecorded.transcribe_file(
+                ulaw_audio,
+                options
+            )
+            transcript = response['results']['channels'][0]['alternatives'][0]['transcript']
+            confidence = response['results']['channels'][0]['alternatives'][0]['confidence']
+            logger.info(f"Transcription for {call_sid}: {transcript} (Confidence: {confidence})")
+
+            if transcript and confidence > 0.5:
+                # Process the transcript using existing workflow
+                if call_sid in active_calls:
+                    session = active_calls[call_sid]
+                else:
+                    session = CallSession(call_sid)
+                    active_calls[call_sid] = session
+
+                session.add_transcription('user', transcript)
+                response_text, new_state = process_text(transcript, session.state)
+                session.state = new_state
+                session.add_transcription('assistant', response_text)
+                session.save_state()
+
+                # Send response via Twilio
+                twiml = VoiceResponse()
+                tts_file = text_to_speech(response_text)
+                if tts_file:
+                    audio_url = f"{config('BASE_URL')}/audio/{tts_file.name}"
+                    twiml.play(audio_url)
+                else:
+                    twiml.say(response_text)
+                twiml.pause(length=30)
+
+                # Update the call with new TwiML
+                call = twilio_client.calls(call_sid).update(twiml=str(twiml))
+                logger.info(f"Updated call {call_sid} with response: {response_text}")
+
+        elif event == 'stop':
+            logger.info("Stream stopped")
+
+    except Exception as e:
+        logger.error(f"Error in WebSocket message handling: {e}")
+
+@app.route('/twiml', methods=['POST'])
+def twiml():
+    call_sid = request.values.get('CallSid')
+    call_sid_map['pending'] = call_sid
+    logger.info(f"Twiml request received, CallSid: {call_sid}")
+
+    response = VoiceResponse()
+    response.say("Welcome to our customer support. How can I help you today?", voice="Polly.Joanna")
+    response.start().stream(url=f"wss://142.93.64.49:5000/twilio-stream")
+    response.pause(length=30)
+    return str(response)
+
 @app.route('/health')
 def health():
     try:
@@ -140,17 +245,8 @@ def answer_call():
     else:
         response.say(welcome_message)
 
-    gather = Gather(
-        input='speech',
-        action='/handle-user-input',
-        speechTimeout='auto',
-        speechModel='phone_call',
-        enhanced=True,
-        timeout=5
-    )
-    response.append(gather)
-    response.redirect('/answer')
-
+    response.start().stream(url=f"wss://142.93.64.49:5000/twilio-stream")
+    response.pause(length=30)
     return str(response)
 
 @app.route('/audio/<path:filename>', methods=['GET'])
@@ -184,15 +280,8 @@ def handle_user_input():
             else:
                 response.say(response_text)
 
-            gather = Gather(
-                input='speech',
-                action='/handle-user-input',
-                speechTimeout='auto',
-                speechModel='phone_call',
-                enhanced=True,
-                timeout=5
-            )
-            response.append(gather)
+            response.start().stream(url=f"wss://142.93.64.49:5000/twilio-stream")
+            response.pause(length=30)
 
             follow_up_message = "Is there anything else I can help you with?"
             tts_follow_up = text_to_speech(follow_up_message)
@@ -215,28 +304,14 @@ def handle_user_input():
             logger.error(f"Error processing speech: {e}")
             response = VoiceResponse()
             response.say("I'm sorry, I'm having trouble understanding. Could you try again?")
-            gather = Gather(
-                input='speech',
-                action='/handle-user-input',
-                speechTimeout='auto',
-                speechModel='phone_call',
-                enhanced=True,
-                timeout=5
-            )
-            response.append(gather)
+            response.start().stream(url=f"wss://142.93.64.49:5000/twilio-stream")
+            response.pause(length=30)
             return str(response)
     else:
         response = VoiceResponse()
         response.say("I didn't catch that. Could you please repeat?")
-        gather = Gather(
-            input='speech',
-            action='/handle-user-input',
-            speechTimeout='auto',
-            speechModel='phone_call',
-            enhanced=True,
-            timeout=5
-        )
-        response.append(gather)
+        response.start().stream(url=f"wss://142.93.64.49:5000/twilio-stream")
+        response.pause(length=30)
         return str(response)
 
 @app.route('/call-status', methods=['POST'])
@@ -257,3 +332,8 @@ def call_status():
         logger.info(f"Cleaned up call resources for {call_sid}")
 
     return '', 200
+
+# NEW: Run the app with SocketIO
+# At the bottom of routes.py
+if __name__ == "__main__":
+    socketio.run(app, host="0.0.0.0", port=5000, ssl_context=('certs/cert.pem', 'certs/key.pem'))

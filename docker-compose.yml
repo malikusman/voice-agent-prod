@@ -47,4 +47,7 @@ services:
     command: gunicorn --bind 0.0.0.0:5000 src.api.routes:app
 
 volumes:
+  - ./certs:/app/certs
   postgres_data:
+
+  

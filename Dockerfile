@@ -4,6 +4,7 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install gevent  # Add gevent for WebSocket support
 RUN mkdir -p /app/static/call_recordings
 
 COPY . .
