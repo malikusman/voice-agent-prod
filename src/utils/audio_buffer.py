@@ -5,6 +5,7 @@ import wave
 import logging
 from src.models.transcript import Transcript
 from src.models.langgraph_state import LangGraphState
+from src.models.call import Call
 from src.db import db
 
 logger = logging.getLogger(__name__)
@@ -18,9 +19,16 @@ class CallSession:
         self.caller_phone = caller_phone
         self.start_time = datetime.now()
         self.audio_buffer = AudioBuffer(call_sid)
-        self.transcription = []
+        self.transcriptions = []  # Renamed to plural for clarity
         self.state = {}
-        self.call_id = None
+        # Initialize call_id by querying the Call model
+        call = db.session.query(Call).filter_by(call_sid=call_sid).first()
+        if not call:
+            logger.error(f"No Call record found for call_sid: {call_sid}")
+            self.call_id = None
+        else:
+            self.call_id = call.id
+            logger.info(f"Initialized CallSession with call_id: {call.id} for call_sid: {call_sid}")
 
     def add_transcription(self, role, text):
         entry = {
@@ -28,7 +36,7 @@ class CallSession:
             'text': text,
             'timestamp': datetime.now().isoformat()
         }
-        self.transcription.append(entry)
+        self.transcriptions.append(entry)
         logger.info(f"[{role.upper()}]: {text}")
 
         if self.call_id:
@@ -39,19 +47,30 @@ class CallSession:
                 timestamp=datetime.now()
             )
             db.session.add(transcript)
-            db.session.commit()
+            try:
+                db.session.commit()
+                logger.info(f"Saved transcript to database for call_id {self.call_id}: {text}")
+            except Exception as e:
+                db.session.rollback()
+                logger.error(f"Error saving transcript to database: {e}")
+        else:
+            logger.warning(f"Cannot save transcript to database: No call_id for call_sid {self.call_sid}")
 
         return entry
 
     def save_transcript(self):
-        if not self.transcription:
+        if not self.transcriptions:
             logger.info(f"No transcriptions to save for call {self.call_sid}")
-            return
+            return None
 
+        # Save to JSON file (optional, can be removed if database is primary storage)
         transcript_path = RECORDINGS_DIR / f"{self.call_sid}_transcript.json"
-        with open(transcript_path, 'w') as f:
-            json.dump(self.transcription, f, indent=2)
-        logger.info(f"Saved transcript to {transcript_path}")
+        try:
+            with open(transcript_path, 'w') as f:
+                json.dump(self.transcriptions, f, indent=2)
+            logger.info(f"Saved transcript to {transcript_path}")
+        except Exception as e:
+            logger.error(f"Error saving transcript to file: {e}")
 
         audio_path = self.audio_buffer.save_to_file()
         if audio_path:
@@ -59,7 +78,13 @@ class CallSession:
         return transcript_path
 
     def save_state(self):
-        if self.call_id and self.state:
+        if not self.call_id:
+            logger.error(f"No call_id found for call_sid: {self.call_sid}")
+            return
+        if not self.state:
+            logger.info(f"No state to save for call_sid: {self.call_sid}")
+            return
+        try:
             state_record = db.session.query(LangGraphState).filter_by(call_id=self.call_id).first()
             if state_record:
                 state_record.state = self.state
@@ -67,7 +92,10 @@ class CallSession:
                 state_record = LangGraphState(call_id=self.call_id, state=self.state)
                 db.session.add(state_record)
             db.session.commit()
-            logger.info(f"Saved LangGraph state for call {self.call_sid}")
+            logger.info(f"Saved LangGraph state for call_id {self.call_id}: {self.state}")
+        except Exception as e:
+            db.session.rollback()
+            logger.error(f"Error saving LangGraph state: {e}")
 
 class AudioBuffer:
     def __init__(self, call_sid):
@@ -82,7 +110,7 @@ class AudioBuffer:
     def save_to_file(self):
         if not self.chunks:
             logger.info(f"No audio chunks to save for call {self.call_sid}")
-            return
+            return None
 
         try:
             with wave.open(str(self.file_path), 'wb') as wf:

@@ -106,8 +106,8 @@ def make_outbound_call():
         logger.error(f"Error making outbound call: {e}")
 
 # NEW: Trigger outbound call in a separate thread
-outbound_thread = threading.Thread(target=make_outbound_call, daemon=True)
-outbound_thread.start()
+# outbound_thread = threading.Thread(target=make_outbound_call, daemon=True)
+# outbound_thread.start()
 
 @app.route('/health')
 def health():
@@ -167,6 +167,7 @@ def handle_user_input():
         active_calls[call_sid] = CallSession(call_sid)
 
     session = active_calls[call_sid]
+    logger.info(f"Session state: {session.state}")
 
     if speech_result:
         session.add_transcription('user', speech_result)
