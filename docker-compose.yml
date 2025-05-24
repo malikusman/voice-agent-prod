@@ -24,7 +24,7 @@ services:
     ports:
       - "5000:5000"
     env_file:
-      - .env  # Explicitly load .env file
+      - .env
     environment:
       - FLASK_ENV=development
       - DATABASE_URL=postgresql://voice_agent_user:voiceagent2025@postgres:5432/voice_agent
@@ -38,6 +38,7 @@ services:
       - GOOGLE_CREDENTIALS_FILE=/app/voice-agent-tts-05f49acb929c.json
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - BASE_URL=${BASE_URL}
+      - ADMIN_API_KEY=${ADMIN_API_KEY}
     volumes:
       - .:/app
       - ./voice-agent-tts-05f49acb929c.json:/app/voice-agent-tts-05f49acb929c.json
@@ -45,6 +46,18 @@ services:
       postgres:
         condition: service_healthy
     command: gunicorn --bind 0.0.0.0:5000 src.api.routes:app
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "80:80"
+    environment:
+      - VITE_API_URL=http://app:5000
+      - VITE_ADMIN_API_KEY=${ADMIN_API_KEY}
+    depends_on:
+      - app
 
 volumes:
   postgres_data:

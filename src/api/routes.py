@@ -16,6 +16,9 @@ from src.models.base import Base
 from src.db import db
 from decouple import config
 from sqlalchemy.sql import text
+from flask import jsonify
+from functools import wraps
+from flask_cors import CORS  # Add this import
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -25,8 +28,14 @@ app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = config('DATABASE_URL')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
+# Enable CORS for all routes, allowing requests from localhost
+CORS(app, resources={r"/api/*": {"origins": "http://localhost"}})
+
 # Initialize db with the Flask app
 db.init_app(app)
+
+# API key for basic security
+API_KEY = config('ADMIN_API_KEY', default='your-secret-api-key')
 
 # Import models
 from src.models.call import Call
@@ -258,3 +267,49 @@ def call_status():
         logger.info(f"Cleaned up call resources for {call_sid}")
 
     return '', 200
+
+# Decorator for API key authentication
+def require_api_key(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        api_key = request.headers.get('X-API-Key')
+        if not api_key or api_key != API_KEY:
+            return jsonify({'error': 'Invalid or missing API key'}), 401
+        return f(*args, **kwargs)
+    return decorated_function
+
+# Endpoint to get all calls
+@app.route('/api/calls', methods=['GET'])
+@require_api_key
+def get_calls():
+    try:
+        calls = db.session.query(Call).all()
+        calls_data = [{
+            'id': call.id,
+            'call_sid': call.call_sid,
+            'caller_phone': call.caller_phone,
+            'status': call.status,
+            'start_time': call.start_time.isoformat() if call.start_time else None,
+            'end_time': call.end_time.isoformat() if call.end_time else None
+        } for call in calls]
+        return jsonify(calls_data)
+    except Exception as e:
+        logger.error(f"Error fetching calls: {e}")
+        return jsonify({'error': 'Failed to fetch calls'}), 500
+
+# Endpoint to get transcripts for a specific call
+@app.route('/api/calls/<int:call_id>/transcripts', methods=['GET'])
+@require_api_key
+def get_transcripts(call_id):
+    try:
+        transcripts = db.session.query(Transcript).filter_by(call_id=call_id).order_by(Transcript.timestamp.asc()).all()
+        transcripts_data = [{
+            'id': transcript.id,
+            'role': transcript.role,
+            'text': transcript.text,
+            'timestamp': transcript.timestamp.isoformat()
+        } for transcript in transcripts]
+        return jsonify(transcripts_data)
+    except Exception as e:
+        logger.error(f"Error fetching transcripts for call_id {call_id}: {e}")
+        return jsonify({'error': 'Failed to fetch transcripts'}), 500
